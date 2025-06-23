@@ -34,7 +34,6 @@
             border-radius: 5px;
             margin: 20px 0;
             letter-spacing: 2px;
-            word-break: break-all;
         }
         
         .file-drop-zone {
@@ -93,12 +92,13 @@
         button:disabled { background: #6c757d; cursor: not-allowed; }
         
         input[type="text"] {
-            width: 300px;
+            width: 200px;
             padding: 10px;
             border: 1px solid #ccc;
             border-radius: 5px;
             font-size: 1.2em;
             text-align: center;
+            letter-spacing: 2px;
         }
         
         input[type="file"] { display: none; }
@@ -116,7 +116,6 @@
 </head>
 <body>
     <h1>WebRTC File Transfer</h1>
-    <p class="center"><em>Powered by PeerJS - No server required!</em></p>
     
     <div class="center">
         <button onclick="initializeSender()">Send Files</button>
@@ -129,9 +128,9 @@
         <div id="sender-status" class="status info">Initializing...</div>
         
         <div id="code-generation" class="center">
-            <p>Your connection ID:</p>
+            <p>Your connection code:</p>
             <div id="connection-code" class="code-display">Generating...</div>
-            <p>Share this ID with the receiver</p>
+            <p>Share this code with the receiver</p>
         </div>
 
         <div id="file-section" style="display:none;">
@@ -158,10 +157,10 @@
         <div id="receiver-status" class="status info">Ready to connect</div>
         
         <div class="center">
-            <p>Enter the sender's ID:</p>
-            <input type="text" id="code-input" placeholder="Enter connection ID">
+            <p>Enter the sender's code:</p>
+            <input type="text" id="code-input" placeholder="Enter 6-digit code" maxlength="6">
             <br><br>
-            <button onclick="connectToSender()">Connect</button>
+            <button onclick="connectWithCode()">Connect</button>
         </div>
 
         <div id="receive-area" style="display:none;">
@@ -170,12 +169,9 @@
         </div>
     </div>
 
-    <!-- PeerJS CDN -->
-    <script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
-    
     <script>
-        let peer;
-        let connection;
+        let peerConnection;
+        let dataChannel;
         let currentRole = null;
         let fileQueue = [];
         let currentFileIndex = 0;
@@ -183,107 +179,228 @@
         let expectedFileSize = 0;
         let receivedSize = 0;
         let currentFileName = '';
-        let peerId = '';
+        let connectionCode = '';
 
         const CHUNK_SIZE = 16384;
+        const SIGNALING_SERVER = 'ws://localhost:3001'; // WebSocket server
+        let socket;
+
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
 
         function initializeSender() {
             currentRole = 'sender';
             document.getElementById('sender-section').classList.add('active');
             document.getElementById('receiver-section').classList.remove('active');
-            
-            updateSenderStatus('Connecting to PeerJS...', 'info');
-            
-            // Create peer with random ID
-            peer = new Peer({
-                host: 'broker-cloud.peerjs.com',
-                port: 443,
-                secure: true,
-                debug: 1
-            });
-
-            peer.on('open', (id) => {
-                peerId = id;
-                document.getElementById('connection-code').textContent = id;
-                updateSenderStatus('Ready! Share your connection ID with the receiver.', 'success');
-            });
-
-            peer.on('connection', (conn) => {
-                connection = conn;
-                setupConnectionHandlers();
-                updateSenderStatus('Receiver connected! You can now select files.', 'success');
-                document.getElementById('file-section').style.display = 'block';
-            });
-
-            peer.on('error', (error) => {
-                console.error('Peer error:', error);
-                updateSenderStatus('Connection error: ' + error.message, 'error');
-            });
+            setupSignaling();
+            generateConnectionCode();
         }
 
         function initializeReceiver() {
             currentRole = 'receiver';
             document.getElementById('receiver-section').classList.add('active');
             document.getElementById('sender-section').classList.remove('active');
-            
-            updateReceiverStatus('Ready to connect', 'info');
+            setupSignaling();
         }
 
-        function connectToSender() {
-            const senderId = document.getElementById('code-input').value.trim();
-            if (!senderId) {
-                updateReceiverStatus('Please enter a connection ID', 'error');
+        function setupSignaling() {
+            try {
+                socket = new WebSocket(SIGNALING_SERVER);
+                
+                socket.onopen = () => {
+                    console.log('Connected to signaling server');
+                    if (currentRole === 'sender') {
+                        updateSenderStatus('Ready to connect. Share your code!', 'success');
+                    }
+                };
+
+                socket.onmessage = (event) => {
+                    handleSignalingMessage(JSON.parse(event.data));
+                };
+
+                socket.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    updateStatus('Connection failed. Make sure the signaling server is running.', 'error');
+                };
+
+                socket.onclose = () => {
+                    console.log('Disconnected from signaling server');
+                };
+            } catch (error) {
+                updateStatus('Cannot connect to signaling server. Please start the server first.', 'error');
+            }
+        }
+
+        function generateConnectionCode() {
+            connectionCode = Math.random().toString(36).substr(2, 6).toUpperCase();
+            document.getElementById('connection-code').textContent = connectionCode;
+            setupPeerConnection();
+            createDataChannel();
+            createOffer();
+        }
+
+        function connectWithCode() {
+            const code = document.getElementById('code-input').value.toUpperCase();
+            if (code.length !== 6) {
+                updateReceiverStatus('Please enter a 6-digit code', 'error');
                 return;
             }
-
-            updateReceiverStatus('Connecting to PeerJS...', 'info');
             
-            // Create receiver peer
-            peer = new Peer({
-                host: 'broker-cloud.peerjs.com',
-                port: 443,
-                secure: true,
-                debug: 1
-            });
-
-            peer.on('open', () => {
-                updateReceiverStatus('Connecting to sender...', 'info');
-                connection = peer.connect(senderId, {
-                    reliable: true
-                });
-                setupConnectionHandlers();
-            });
-
-            peer.on('error', (error) => {
-                console.error('Peer error:', error);
-                updateReceiverStatus('Connection error: ' + error.message, 'error');
-            });
+            connectionCode = code;
+            setupPeerConnection();
+            
+            // Request offer from sender
+            socket.send(JSON.stringify({
+                type: 'request-offer',
+                code: connectionCode
+            }));
+            
+            updateReceiverStatus('Connecting...', 'info');
         }
 
-        function setupConnectionHandlers() {
-            connection.on('open', () => {
-                if (currentRole === 'sender') {
-                    updateSenderStatus('Connected! Ready to send files.', 'success');
-                } else {
-                    updateReceiverStatus('Connected! Ready to receive files.', 'success');
-                    document.getElementById('receive-area').style.display = 'block';
+        function setupPeerConnection() {
+            peerConnection = new RTCPeerConnection(configuration);
+
+            peerConnection.onicecandidate = (event) => {
+                // ICE candidates will be included in offer/answer
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                const state = peerConnection.connectionState;
+                console.log('Connection state:', state);
+                
+                if (state === 'connected') {
+                    updateStatus('Connected! Ready to transfer files.', 'success');
+                    if (currentRole === 'sender') {
+                        document.getElementById('file-section').style.display = 'block';
+                    } else {
+                        document.getElementById('receive-area').style.display = 'block';
+                    }
                 }
-            });
+            };
 
-            connection.on('data', (data) => {
-                if (currentRole === 'receiver') {
-                    handleIncomingData(data);
-                }
-            });
+            if (currentRole === 'receiver') {
+                peerConnection.ondatachannel = (event) => {
+                    dataChannel = event.channel;
+                    setupDataChannelHandlers();
+                };
+            }
+        }
 
-            connection.on('close', () => {
-                updateStatus('Connection closed', 'info');
+        function createDataChannel() {
+            dataChannel = peerConnection.createDataChannel('fileTransfer', {
+                ordered: true
             });
+            setupDataChannelHandlers();
+        }
 
-            connection.on('error', (error) => {
-                console.error('Connection error:', error);
-                updateStatus('Data connection error: ' + error.message, 'error');
-            });
+        function setupDataChannelHandlers() {
+            dataChannel.onopen = () => {
+                console.log('Data channel opened');
+            };
+
+            dataChannel.onmessage = (event) => {
+                handleIncomingData(event.data);
+            };
+
+            dataChannel.onerror = (error) => {
+                console.error('Data channel error:', error);
+            };
+        }
+
+        async function createOffer() {
+            try {
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                // Wait for ICE gathering
+                await new Promise((resolve) => {
+                    if (peerConnection.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        peerConnection.addEventListener('icegatheringstatechange', () => {
+                            if (peerConnection.iceGatheringState === 'complete') {
+                                resolve();
+                            }
+                        });
+                    }
+                });
+
+                // Store offer for when receiver requests it
+                const offerData = JSON.stringify(peerConnection.localDescription);
+                
+                // Send offer to signaling server
+                socket.send(JSON.stringify({
+                    type: 'store-offer',
+                    code: connectionCode,
+                    offer: offerData
+                }));
+
+            } catch (error) {
+                console.error('Error creating offer:', error);
+                updateSenderStatus('Error creating connection', 'error');
+            }
+        }
+
+        async function handleSignalingMessage(message) {
+            switch (message.type) {
+                case 'offer':
+                    if (currentRole === 'receiver') {
+                        try {
+                            const offer = JSON.parse(message.offer);
+                            await peerConnection.setRemoteDescription(offer);
+                            
+                            const answer = await peerConnection.createAnswer();
+                            await peerConnection.setLocalDescription(answer);
+                            
+                            // Wait for ICE gathering
+                            await new Promise((resolve) => {
+                                if (peerConnection.iceGatheringState === 'complete') {
+                                    resolve();
+                                } else {
+                                    peerConnection.addEventListener('icegatheringstatechange', () => {
+                                        if (peerConnection.iceGatheringState === 'complete') {
+                                            resolve();
+                                        }
+                                    });
+                                }
+                            });
+
+                            const answerData = JSON.stringify(peerConnection.localDescription);
+                            
+                            socket.send(JSON.stringify({
+                                type: 'answer',
+                                code: connectionCode,
+                                answer: answerData
+                            }));
+                            
+                        } catch (error) {
+                            console.error('Error handling offer:', error);
+                            updateReceiverStatus('Connection failed', 'error');
+                        }
+                    }
+                    break;
+
+                case 'answer':
+                    if (currentRole === 'sender') {
+                        try {
+                            const answer = JSON.parse(message.answer);
+                            await peerConnection.setRemoteDescription(answer);
+                        } catch (error) {
+                            console.error('Error handling answer:', error);
+                            updateSenderStatus('Connection failed', 'error');
+                        }
+                    }
+                    break;
+
+                case 'error':
+                    updateStatus(message.message, 'error');
+                    break;
+            }
         }
 
         function handleFileSelect(event) {
@@ -293,7 +410,7 @@
             fileQueue = files;
             displayFileList();
             
-            if (connection && connection.open) {
+            if (dataChannel && dataChannel.readyState === 'open') {
                 startFileTransfer();
             } else {
                 updateSenderStatus('Files selected. Waiting for connection...', 'info');
@@ -325,25 +442,19 @@
             const file = fileQueue[currentFileIndex];
             updateSenderStatus(`Sending: ${file.name}`, 'info');
 
-            // Send file metadata
             const metadata = {
                 type: 'file-start',
                 name: file.name,
                 size: file.size,
                 fileType: file.type
             };
-            connection.send(metadata);
+            dataChannel.send(JSON.stringify(metadata));
 
-            // Read and send file in chunks
             const reader = new FileReader();
             let offset = 0;
 
             reader.onload = (event) => {
-                const chunk = {
-                    type: 'file-chunk',
-                    data: Array.from(new Uint8Array(event.target.result))
-                };
-                connection.send(chunk);
+                dataChannel.send(event.target.result);
                 offset += CHUNK_SIZE;
 
                 const progress = Math.min((offset / file.size) * 100, 100);
@@ -352,8 +463,9 @@
                 if (offset < file.size) {
                     readNextChunk();
                 } else {
-                    // File transfer complete
-                    connection.send({ type: 'file-end' });
+                    const endMessage = { type: 'file-end' };
+                    dataChannel.send(JSON.stringify(endMessage));
+                    
                     currentFileIndex++;
                     setTimeout(() => startFileTransfer(), 100);
                 }
@@ -368,30 +480,39 @@
         }
 
         function handleIncomingData(data) {
-            if (data.type === 'file-start') {
-                currentFileName = data.name;
-                expectedFileSize = data.size;
-                receivedSize = 0;
-                receivedChunks = [];
-                updateReceiverStatus(`Receiving: ${data.name}`, 'info');
-                
-                const receivedFiles = document.getElementById('received-files');
-                const fileDiv = document.createElement('div');
-                fileDiv.className = 'file-info';
-                fileDiv.id = `file-${Date.now()}`;
-                fileDiv.innerHTML = `
-                    <strong>${data.name}</strong><br>
-                    Size: ${formatFileSize(data.size)}<br>
-                    <div class="progress-bar">
-                        <div class="progress-fill" id="receive-progress-${Date.now()}">0%</div>
-                    </div>
-                `;
-                receivedFiles.appendChild(fileDiv);
-                
-            } else if (data.type === 'file-chunk') {
-                const chunkData = new Uint8Array(data.data);
-                receivedChunks.push(chunkData);
-                receivedSize += chunkData.length;
+            if (typeof data === 'string') {
+                try {
+                    const message = JSON.parse(data);
+                    
+                    if (message.type === 'file-start') {
+                        currentFileName = message.name;
+                        expectedFileSize = message.size;
+                        receivedSize = 0;
+                        receivedChunks = [];
+                        updateReceiverStatus(`Receiving: ${message.name}`, 'info');
+                        
+                        const receivedFiles = document.getElementById('received-files');
+                        const fileDiv = document.createElement('div');
+                        fileDiv.className = 'file-info';
+                        fileDiv.innerHTML = `
+                            <strong>${message.name}</strong><br>
+                            Size: ${formatFileSize(message.size)}<br>
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="receive-progress-${Date.now()}">0%</div>
+                            </div>
+                        `;
+                        receivedFiles.appendChild(fileDiv);
+                    } else if (message.type === 'file-end') {
+                        const blob = new Blob(receivedChunks);
+                        downloadFile(blob, currentFileName);
+                        updateReceiverStatus(`Received: ${currentFileName}`, 'success');
+                    }
+                } catch (e) {
+                    console.error('Error parsing message:', e);
+                }
+            } else {
+                receivedChunks.push(data);
+                receivedSize += data.byteLength;
                 
                 const progress = (receivedSize / expectedFileSize) * 100;
                 const progressElements = document.querySelectorAll('.progress-fill');
@@ -400,16 +521,6 @@
                     lastProgress.style.width = `${progress}%`;
                     lastProgress.textContent = `${Math.round(progress)}%`;
                 }
-                
-            } else if (data.type === 'file-end') {
-                // Combine all chunks into a single blob
-                const blob = new Blob(receivedChunks);
-                downloadFile(blob, currentFileName);
-                updateReceiverStatus(`Received: ${currentFileName}`, 'success');
-                
-                // Reset for next file
-                receivedChunks = [];
-                receivedSize = 0;
             }
         }
 
@@ -487,7 +598,7 @@
                         fileQueue = files;
                         displayFileList();
                         
-                        if (connection && connection.open) {
+                        if (dataChannel && dataChannel.readyState === 'open') {
                             startFileTransfer();
                         }
                     }
