@@ -112,6 +112,20 @@
         }
         
         .center { text-align: center; }
+        
+        .qr-code {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .share-link {
+            background: #e9ecef;
+            padding: 10px;
+            border-radius: 5px;
+            word-break: break-all;
+            margin: 10px 0;
+            font-family: monospace;
+        }
     </style>
 </head>
 <body>
@@ -120,6 +134,7 @@
     <div class="center">
         <button onclick="initializeSender()">Send Files</button>
         <button onclick="initializeReceiver()">Receive Files</button>
+        <button onclick="autoConnect()">Auto Connect</button>
     </div>
 
     <!-- Sender Section -->
@@ -131,6 +146,13 @@
             <p>Your connection code:</p>
             <div id="connection-code" class="code-display">Generating...</div>
             <p>Share this code with the receiver</p>
+            
+            <div class="share-link" id="share-link" style="display:none;">
+                <strong>Share this link:</strong><br>
+                <span id="share-url"></span>
+            </div>
+            
+            <button onclick="copyShareLink()">Copy Share Link</button>
         </div>
 
         <div id="file-section" style="display:none;">
@@ -169,6 +191,13 @@
         </div>
     </div>
 
+    <!-- Auto Connect Section -->
+    <div id="auto-section" class="section">
+        <h2>Auto Connect</h2>
+        <div id="auto-status" class="status info">Looking for available connections...</div>
+        <div id="available-connections"></div>
+    </div>
+
     <script>
         let peerConnection;
         let dataChannel;
@@ -182,8 +211,7 @@
         let connectionCode = '';
 
         const CHUNK_SIZE = 16384;
-        const SIGNALING_SERVER = 'ws://localhost:3001'; // WebSocket server
-        let socket;
+        const API_BASE = '/api/signaling';
 
         const configuration = {
             iceServers: [
@@ -192,11 +220,22 @@
             ]
         };
 
+        // Check for auto-connect from URL
+        window.addEventListener('load', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const autoCode = urlParams.get('code');
+            if (autoCode) {
+                document.getElementById('code-input').value = autoCode.toUpperCase();
+                initializeReceiver();
+                setTimeout(() => connectWithCode(), 1000);
+            }
+        });
+
         function initializeSender() {
             currentRole = 'sender';
             document.getElementById('sender-section').classList.add('active');
             document.getElementById('receiver-section').classList.remove('active');
-            setupSignaling();
+            document.getElementById('auto-section').classList.remove('active');
             generateConnectionCode();
         }
 
@@ -204,46 +243,40 @@
             currentRole = 'receiver';
             document.getElementById('receiver-section').classList.add('active');
             document.getElementById('sender-section').classList.remove('active');
-            setupSignaling();
+            document.getElementById('auto-section').classList.remove('active');
         }
 
-        function setupSignaling() {
-            try {
-                socket = new WebSocket(SIGNALING_SERVER);
-                
-                socket.onopen = () => {
-                    console.log('Connected to signaling server');
-                    if (currentRole === 'sender') {
-                        updateSenderStatus('Ready to connect. Share your code!', 'success');
-                    }
-                };
-
-                socket.onmessage = (event) => {
-                    handleSignalingMessage(JSON.parse(event.data));
-                };
-
-                socket.onerror = (error) => {
-                    console.error('WebSocket error:', error);
-                    updateStatus('Connection failed. Make sure the signaling server is running.', 'error');
-                };
-
-                socket.onclose = () => {
-                    console.log('Disconnected from signaling server');
-                };
-            } catch (error) {
-                updateStatus('Cannot connect to signaling server. Please start the server first.', 'error');
-            }
+        function autoConnect() {
+            document.getElementById('auto-section').classList.add('active');
+            document.getElementById('sender-section').classList.remove('active');
+            document.getElementById('receiver-section').classList.remove('active');
+            // For demo purposes, just show available connections
+            updateAutoStatus('Feature coming soon! Use manual connection for now.', 'info');
         }
 
         function generateConnectionCode() {
             connectionCode = Math.random().toString(36).substr(2, 6).toUpperCase();
             document.getElementById('connection-code').textContent = connectionCode;
+            
+            // Generate share link
+            const shareUrl = `${window.location.origin}${window.location.pathname}?code=${connectionCode}`;
+            document.getElementById('share-url').textContent = shareUrl;
+            document.getElementById('share-link').style.display = 'block';
+            
             setupPeerConnection();
             createDataChannel();
             createOffer();
         }
 
-        function connectWithCode() {
+        function copyShareLink() {
+            const shareUrl = document.getElementById('share-url').textContent;
+            navigator.clipboard.writeText(shareUrl).then(() => {
+                updateSenderStatus('Share link copied to clipboard!', 'success');
+                setTimeout(() => updateSenderStatus('Ready to connect. Share your code!', 'info'), 2000);
+            });
+        }
+
+        async function connectWithCode() {
             const code = document.getElementById('code-input').value.toUpperCase();
             if (code.length !== 6) {
                 updateReceiverStatus('Please enter a 6-digit code', 'error');
@@ -251,23 +284,55 @@
             }
             
             connectionCode = code;
-            setupPeerConnection();
-            
-            // Request offer from sender
-            socket.send(JSON.stringify({
-                type: 'request-offer',
-                code: connectionCode
-            }));
-            
             updateReceiverStatus('Connecting...', 'info');
+            
+            try {
+                // Get offer from server
+                const response = await fetch(API_BASE, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'get-offer',
+                        code: connectionCode
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Invalid code or code expired');
+                }
+
+                const { offer } = await response.json();
+                
+                setupPeerConnection();
+                await peerConnection.setRemoteDescription(JSON.parse(offer));
+                
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                
+                // Wait for ICE gathering
+                await waitForIceGathering();
+                
+                // Send answer back
+                await fetch(API_BASE, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'store-answer',
+                        code: connectionCode,
+                        answer: JSON.stringify(peerConnection.localDescription)
+                    })
+                });
+                
+                updateReceiverStatus('Connected! Waiting for files...', 'success');
+                
+            } catch (error) {
+                console.error('Connection error:', error);
+                updateReceiverStatus('Connection failed: ' + error.message, 'error');
+            }
         }
 
         function setupPeerConnection() {
             peerConnection = new RTCPeerConnection(configuration);
-
-            peerConnection.onicecandidate = (event) => {
-                // ICE candidates will be included in offer/answer
-            };
 
             peerConnection.onconnectionstatechange = () => {
                 const state = peerConnection.connectionState;
@@ -317,28 +382,26 @@
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
                 
-                // Wait for ICE gathering
-                await new Promise((resolve) => {
-                    if (peerConnection.iceGatheringState === 'complete') {
-                        resolve();
-                    } else {
-                        peerConnection.addEventListener('icegatheringstatechange', () => {
-                            if (peerConnection.iceGatheringState === 'complete') {
-                                resolve();
-                            }
-                        });
-                    }
+                await waitForIceGathering();
+                
+                // Store offer on server
+                const response = await fetch(API_BASE, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        action: 'store-offer',
+                        code: connectionCode,
+                        offer: JSON.stringify(peerConnection.localDescription)
+                    })
                 });
 
-                // Store offer for when receiver requests it
-                const offerData = JSON.stringify(peerConnection.localDescription);
-                
-                // Send offer to signaling server
-                socket.send(JSON.stringify({
-                    type: 'store-offer',
-                    code: connectionCode,
-                    offer: offerData
-                }));
+                if (response.ok) {
+                    updateSenderStatus('Ready to connect. Share your code!', 'success');
+                    // Poll for answer
+                    pollForAnswer();
+                } else {
+                    throw new Error('Failed to store offer');
+                }
 
             } catch (error) {
                 console.error('Error creating offer:', error);
@@ -346,61 +409,35 @@
             }
         }
 
-        async function handleSignalingMessage(message) {
-            switch (message.type) {
-                case 'offer':
-                    if (currentRole === 'receiver') {
-                        try {
-                            const offer = JSON.parse(message.offer);
-                            await peerConnection.setRemoteDescription(offer);
-                            
-                            const answer = await peerConnection.createAnswer();
-                            await peerConnection.setLocalDescription(answer);
-                            
-                            // Wait for ICE gathering
-                            await new Promise((resolve) => {
-                                if (peerConnection.iceGatheringState === 'complete') {
-                                    resolve();
-                                } else {
-                                    peerConnection.addEventListener('icegatheringstatechange', () => {
-                                        if (peerConnection.iceGatheringState === 'complete') {
-                                            resolve();
-                                        }
-                                    });
-                                }
-                            });
-
-                            const answerData = JSON.stringify(peerConnection.localDescription);
-                            
-                            socket.send(JSON.stringify({
-                                type: 'answer',
-                                code: connectionCode,
-                                answer: answerData
-                            }));
-                            
-                        } catch (error) {
-                            console.error('Error handling offer:', error);
-                            updateReceiverStatus('Connection failed', 'error');
-                        }
-                    }
-                    break;
-
-                case 'answer':
-                    if (currentRole === 'sender') {
-                        try {
-                            const answer = JSON.parse(message.answer);
-                            await peerConnection.setRemoteDescription(answer);
-                        } catch (error) {
-                            console.error('Error handling answer:', error);
-                            updateSenderStatus('Connection failed', 'error');
-                        }
-                    }
-                    break;
-
-                case 'error':
-                    updateStatus(message.message, 'error');
-                    break;
+        async function pollForAnswer() {
+            try {
+                const response = await fetch(`${API_BASE}?action=poll-answer&code=${connectionCode}`);
+                
+                if (response.ok) {
+                    const { answer } = await response.json();
+                    await peerConnection.setRemoteDescription(JSON.parse(answer));
+                    updateSenderStatus('Connected! Select files to send.', 'success');
+                } else {
+                    updateSenderStatus('Waiting for receiver...', 'info');
+                }
+            } catch (error) {
+                console.error('Error polling for answer:', error);
+                updateSenderStatus('Connection error', 'error');
             }
+        }
+
+        function waitForIceGathering() {
+            return new Promise((resolve) => {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    resolve();
+                } else {
+                    peerConnection.addEventListener('icegatheringstatechange', () => {
+                        if (peerConnection.iceGatheringState === 'complete') {
+                            resolve();
+                        }
+                    });
+                }
+            });
         }
 
         function handleFileSelect(event) {
@@ -560,6 +597,12 @@
 
         function updateReceiverStatus(message, type = 'info') {
             const statusElement = document.getElementById('receiver-status');
+            statusElement.textContent = message;
+            statusElement.className = `status ${type}`;
+        }
+
+        function updateAutoStatus(message, type = 'info') {
+            const statusElement = document.getElementById('auto-status');
             statusElement.textContent = message;
             statusElement.className = `status ${type}`;
         }
